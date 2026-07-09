@@ -8,9 +8,9 @@ from ..auth import (
     decode_token,
     get_token_payload,
     hash_password,
+    mark_refresh_token_used,
     revoke_access_token,
     verify_password,
-    _used_refresh_tokens
 )
 from ..database import get_db
 from ..errors import AppError
@@ -78,15 +78,15 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
 
-    if data["jti"] in _used_refresh_tokens:
-        raise AppError(401, "UNAUTHORIZED", "Refresh token already used")
-    _used_refresh_tokens.add(data["jti"])
-
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+
+    mark_refresh_token_used(data)
+
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),

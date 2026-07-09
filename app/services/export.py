@@ -46,16 +46,14 @@ def generate_export(
     include_all: bool,
 ) -> str:
     if include_all:
-        if room_id is not None:
-            rows = fetch_bookings_raw(db, room_id)
-        else:
-            rows = _fetch_scoped(db, org_id, None, None)
+        rows = _fetch_scoped(db, org_id, None, room_id)
     else:
         rows = _fetch_scoped(db, org_id, user_id, room_id)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(EXPORT_HEADER)
+
     for b in rows:
         writer.writerow(
             [
@@ -69,4 +67,5 @@ def generate_export(
                 b.price_cents,
             ]
         )
+
     return buffer.getvalue()
