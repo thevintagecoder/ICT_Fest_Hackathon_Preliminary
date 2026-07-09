@@ -1,6 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
-import time
-import threading
+import time, threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
