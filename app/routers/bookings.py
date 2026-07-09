@@ -1,4 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -22,6 +23,8 @@ MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
+
+_booking_create_lock = threading.RLock()
 
 
 def _pricing_warmup() -> None:
@@ -47,7 +50,7 @@ def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> 
     )
     _pricing_warmup()
     for b in existing:
-        if b.start_time <= end and start <= b.end_time:
+        if b.start_time < end and start < b.end_time:
             return True
     return False
 
@@ -77,52 +80,77 @@ def create_booking(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    ratelimit.record_and_check(user.id)
+    with _booking_create_lock:
+        ratelimit.record_and_check(user.id)
 
-    start = parse_input_datetime(payload.start_time)
-    end = parse_input_datetime(payload.end_time)
-    now = datetime.utcnow()
+        start = parse_input_datetime(payload.start_time)
+        end = parse_input_datetime(payload.end_time)
+        now = datetime.utcnow()
 
-    if start <= now - timedelta(seconds=300):
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
+        if start <= now:
+            raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
 
-    duration_hours = (end - start).total_seconds() / 3600
-    if duration_hours != int(duration_hours):
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
-    duration_hours = int(duration_hours)
-    if duration_hours > MAX_DURATION_HOURS:
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
+        duration_seconds = (end - start).total_seconds()
 
-    room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
-    if room is None:
-        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+        if duration_seconds <= 0:
+            raise AppError(400, "INVALID_BOOKING_WINDOW", "end_time must be after start_time")
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+        if duration_seconds % 3600 != 0:
+            raise AppError(
+                400,
+                "INVALID_BOOKING_WINDOW",
+                "duration must be a whole number of hours",
+            )
 
-    _check_quota(db, user.id, now, start)
+        duration_hours = int(duration_seconds // 3600)
 
-    price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
+        if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
+            raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
-    stats.record_create(room.id, price_cents)
-    cache.invalidate_availability(room.id, start.date().isoformat())
+        room = (
+            db.query(Room)
+            .filter(Room.id == payload.room_id, Room.org_id == user.org_id)
+            .first()
+        )
+
+        if room is None:
+            raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+
+        if _has_conflict(db, room.id, start, end):
+            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+
+        _check_quota(db, user.id, now, start)
+
+        price_cents = room.hourly_rate_cents * duration_hours
+
+        booking = Booking(
+            room_id=room.id,
+            user_id=user.id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+
+        booking_id = booking.id
+        room_id = room.id
+        org_id = user.org_id
+        start_date = start.date().isoformat()
+
+    stats.record_create(room_id, price_cents)
+
+    cache.invalidate_availability(room_id, start_date)
+    cache.invalidate_report(org_id)
+
     notifications.notify_created(booking)
 
     return serialize_booking(booking)
-
 
 @router.get("/bookings")
 def list_bookings(
